@@ -1,11 +1,21 @@
 import pandas as pd
 
+# ==============================================================================
+# SECTION 1: HELPER FUNCTIONS FOR TAX CALCULATIONS
+# ==============================================================================
+# These functions handle the complexity of Quebec + Federal tax brackets.
+# They are used to determine your "Marginal Tax Rate" (tax on next dollar earned).
+
 def get_combined_brackets():
     """
     Returns a sorted list of (threshold, combined_marginal_rate) for 2026.
-    Merges Federal and Quebec brackets to create a unified set of marginal rates.
+    
+    HOW IT WORKS:
+    - Merges Federal and Quebec tax brackets into a unified list.
+    - Applies the "Quebec Abatement" (16.5% reduction) to the Federal rate.
+    - Returns a list like: [(258k, 53%), (181k, 49%), ...]
     """
-    # 2026 Federal Brackets
+    # 2026 Federal Brackets (Estimated based on 2025 + indexation)
     fed_brackets = [
         (258482, 0.33),
         (181440, 0.29),
@@ -14,7 +24,7 @@ def get_combined_brackets():
         (0, 0.14)
     ]
     
-    # 2026 Quebec Brackets
+    # 2026 Quebec Brackets (Estimated)
     qc_brackets = [
         (132245, 0.2575),
         (108680, 0.24),
@@ -22,28 +32,29 @@ def get_combined_brackets():
         (0, 0.14)
     ]
 
-    # Create a set of all unique thresholds
+    # Create a set of all unique thresholds from both governments
     all_thresholds = set(f[0] for f in fed_brackets) | set(q[0] for q in qc_brackets)
     sorted_thresholds = sorted(list(all_thresholds), reverse=True)
     
     combined_brackets = []
     
     for t in sorted_thresholds:
-        # Determine Fed Rate at this threshold
+        # Determine Fed Rate strictly at this threshold
         f_rate = 0.0
         for ft, fr in fed_brackets:
             if t >= ft:
                 f_rate = fr
                 break
                 
-        # Determine QC Rate at this threshold
+        # Determine QC Rate strictly at this threshold
         q_rate = 0.0
         for qt, qr in qc_brackets:
             if t >= qt:
                 q_rate = qr
                 break
         
-        # Calculate Combined Rate
+        # Calculate Combined Rate with Quebec Abatement
+        # Formula: (FedRate * (1 - 0.165)) + QcRate
         effective_fed_rate = f_rate * (1 - 0.165)
         combined_rate = effective_fed_rate + q_rate
         
@@ -53,54 +64,65 @@ def get_combined_brackets():
 
 def get_marginal_tax_rate(income, brackets):
     """
-    Calculates marginal rate using the pre-calculated combined brackets.
+    Calculates your marginal rate given your current income.
+    Inputs:
+        income: Your taxable income
+        brackets: The list returned by get_combined_brackets()
     """
     for threshold, rate in brackets:
         if income > threshold:
             return rate
     return brackets[-1][1] # Fallback to lowest rate
 
+# ==============================================================================
+# SECTION 2: MAIN OPTIMIZATION SIMULATION
+# ==============================================================================
+# This is the core engine. It simulates your financial life year-by-year.
+
 def optimize_rrsp_strategy(
     current_year=2026,
     start_earning_year=2020,
-    current_annual_income=25000,
-    full_time_start_year=2027,
-    expected_full_time_wage=85000,
-    wage_growth_rate=0.03,
+    current_annual_income=20000,
+    full_time_start_year=2030,
+    expected_full_time_wage=80000,
+    wage_growth_rate=0.04,
     employer_match_rate=0.05,
     risk_free_rate=0.05,
-    retirement_income_target=60000,     # Expected taxable income in retirement
-    savings_rate_gross=0.25             # Portion of gross income available for savings (increased to allow room usage)
+    retirement_income_target=55000,     # Expected taxable income in retirement
+    savings_rate_gross=0.6             # Portion of gross income available for savings
 ):
     
-    # Constants
+    # --- A. SETUP & CONSTANTS ---
     rrsp_max_limit_2026 = 33810
-    limit_indexing = 0.02
+    limit_indexing = 0.02 # Assumed annual increase in CRA contribution limits
     
-    # Pre-calculate unified tax brackets
+    # Pre-calculate unified tax brackets for use in the loop
     combined_brackets = get_combined_brackets()
     
-    # Determine retirement tax rate
+    # Determine the benchmark: What tax rate will I pay in retirement?
+    # If I save tax at 40% now but pay 30% in retirement -> Good Deal.
+    # If I save tax at 30% now and pay 30% in retirement -> Neutral (TFSA might be better).
     retirement_tax_rate = get_marginal_tax_rate(retirement_income_target, combined_brackets)
     
-    # State variables
     data = []
     accumulated_room = 0.0
     rrsp_balance = 0.0
     
-    # Simulation range
+    # Simulation range (10 years after full time starts)
     end_year = full_time_start_year + 10
     
-    # 1. Past Room Calculation
+    # --- B. HISTORICAL ROOM CALCULATION ---
+    # We estimate how much RRSP room you accumulated while working part-time/internships.
     years_worked_before_now = current_year - start_earning_year
     avg_past_income = 15000 
     accumulated_room += (avg_past_income * 0.18) * years_worked_before_now
 
     current_income_sim = current_annual_income
-    
+
+    # --- C. MAIN YEARLY LOOP ---
     for year in range(current_year, end_year + 1):
         
-        # 1. Update Income
+        # 1. Update Income (Simulate raises and graduation)
         if year >= full_time_start_year:
             if year == full_time_start_year:
                 current_income_sim = expected_full_time_wage
@@ -108,103 +130,84 @@ def optimize_rrsp_strategy(
                 current_income_sim *= (1 + wage_growth_rate)
         
         # 2. Update Contribution Limits
+        # You earn new room equal to 18% of your previous year's earned income.
+        # (Simplified to current year for this simulation)
         new_room_generated = current_income_sim * 0.18
-        annual_max = rrsp_max_limit_2026 * ((1 + limit_indexing) ** (year - 2026))
         
+        # The government caps new room (e.g. ~$32k)
+        annual_max = rrsp_max_limit_2026 * ((1 + limit_indexing) ** (year - 2026))
         if new_room_generated > annual_max:
             new_room_generated = annual_max
             
-        # Snapshot Total Room (Opening Balance + New)
+        # Total Room = Old Room carried forward + New Room
         total_room_available = accumulated_room + new_room_generated
         
-        # 3. Strategy Logic
+        # 3. Strategy Logic (The "Brain")
         
-        # A. Employer Match (Always take this first)
+        # STEP 3A: Employer Match
+        # ALWAYS take the match. It's free money (100% return instantly).
         match_contribution = current_income_sim * employer_match_rate
+        # Your mandatory contribution to get the match:
+        user_base_contribution = current_income_sim * employer_match_rate 
         
-        # B. Optimization Logic (Waterfall / Fill-Down)
-        # We start with taxable income and "fill" RRSP to knock down income from high brackets
-        # until the marginal rate is <= retirement rate.
+        # STEP 3B: Optimization (Waterfall Strategy)
+        # Should we contribute MORE than the match?
+        # Only if our Current Tax Rate > Retirement Tax Rate.
         
-        # Max cash available for RRSP (User contribution part)
+        # Calculate how much cash we have available to save
         max_user_cash = (current_income_sim * savings_rate_gross)
         cash_remaining = max_user_cash
         
-        # Pay for the match first
-        user_base_contribution = current_income_sim * employer_match_rate
+        # Pay for the mandatory match first using our cash
         cash_remaining -= user_base_contribution
-        
-        # Contribution starts with mandatory match basis
         total_user_contribution = user_base_contribution
         
-        # Current effective taxable income (before extra contributions)
-        # Note: We assume the user_base_contribution is also an RRSP contribution reducing income
+        # Calculate our "Effective Taxable Income" 
+        # (This is Income minus what we've already contributed)
         current_taxable_income = current_income_sim - user_base_contribution
         
-        # Calculate extra optimization
         extra_contribution = 0.0
         
-        # Iterate brackets primarily to find chunks of income to shelter
-        # We only care about brackets where rate > retirement_rate
-        
+        # Loop through tax brackets from Top -> Bottom
         for threshold, rate in combined_brackets:
+            # If this bracket's tax rate is NOT higher than retirement rate, stop optimization.
+            # It's not worth locking money away if you don't save extra tax.
             if rate <= retirement_tax_rate:
-                continue # No tax arbitrage benefit here
+                continue 
             
-            # If current income is above this bracket's floor (threshold)
+            # If our income sits in this high bracket...
             if current_taxable_income > threshold:
-                # Calculate how much income is in this band
+                # How much income is in this specific bracket?
                 income_in_band = current_taxable_income - threshold
                 
-                # Determine how much we CAN contribute for this band
-                # Constraints: Room, Cash
+                # How much CAN we contribute? (Limited by Room and Cash)
                 room_remaining = total_room_available - total_user_contribution
-                
                 amount_to_contribute = min(income_in_band, room_remaining, cash_remaining)
                 
+                # Make the contribution
                 if amount_to_contribute > 0:
                     extra_contribution += amount_to_contribute
                     total_user_contribution += amount_to_contribute
                     cash_remaining -= amount_to_contribute
-                    current_taxable_income -= amount_to_contribute # Reduce income for next iteration
+                    current_taxable_income -= amount_to_contribute
                 
+                # Stop if we run out of cash or room
                 if cash_remaining <= 0 or (total_room_available - total_user_contribution) <= 0:
                     break
         
-        # Safety check against total room (should be handled in loop, but double check)
+        # Final safety check against room limits
         if total_user_contribution > total_room_available:
             total_user_contribution = total_room_available
             
-        # 4. Update Balances
+        # 4. Update Balances for next year
         accumulated_room = total_room_available - total_user_contribution
         total_inflow = total_user_contribution + match_contribution
         rrsp_balance = (rrsp_balance * (1 + risk_free_rate)) + total_inflow
         
-        # 5. Calculate Tax Savings
-        # To be precise, we need to calculate Tax(Original) - Tax(New)
-        # Since we have logic for marginal, let's approximate or do it roughly
-        # For display, approximate based on weighted average of brackets used is okay, 
-        # or simplified: (User Cont * Marginal) is what the user asked for previously
-        # but let's make it the "Money Saved" relative to retirement
-        # Actually, standard "Tax Savings" usually means reduction in current year tax bill.
-        # Let's calculate that properly? No, let's stick to the simpler sum(chunk * rate)
-        
-        # Re-calc precise savings from the chunks
-        # effectively: sum of (amount_in_bracket * bracket_rate)
-        # We can just sum it up as we go, or recalculate.
-        # Let's do a quick pass to estimate savings
-        # actually marginal_rate at start is useful for display
+        # 5. Review Metrics (For display only)
         start_marginal_rate = get_marginal_tax_rate(current_income_sim, combined_brackets)
         
-        # Simple tax savings calc:
-        # We reduced taxable income from X to Y. 
-        # Savings = Tax(X) - Tax(Y). 
-        # Let's just approximate for the display to keep it simple unless requested otherwise.
-        # The user said "optimizes money saved", which implies the strategy, not necessarily the column.
-        # I will leave Tax Savings as a simple calc for now or simple "Effective Rate * Contribution" 
-        # but since we spanned brackets, better to be (Contribution * Avg Rate of those brackets)
-        # Let's just use the `extra_contribution` logic to track savings if possible.
-        # Re-simplifying for display:
+        # Calculate approximate immediate tax savings from this contribution
         tax_savings = 0.0
         temp_income = current_income_sim
         remaining_contrib_to_account = total_user_contribution
@@ -221,7 +224,7 @@ def optimize_rrsp_strategy(
             "Income": round(current_income_sim, 0),
             "Marginal Rate": f"{round(start_marginal_rate * 100, 1)}%",
             "Contribution": round(total_user_contribution, 0),
-            "Employer Match": round(match_contribution*0.05, 0),
+            "Employer Match": round(match_contribution, 0), # Match is "free" money on top
             "Total Invested": round(total_inflow, 0),
             "Total Room Available": round(total_room_available, 0),
             "RRSP Room Left": round(accumulated_room, 0),
@@ -231,18 +234,12 @@ def optimize_rrsp_strategy(
 
     return pd.DataFrame(data)
 
-# --- USER INPUTS ---
-# Change these values to fit your scenario
-df_plan = optimize_rrsp_strategy(
-    current_year=2026,
-    start_earning_year=2020,         # When you first started working part-time
-    current_annual_income=25000,      # Your 2026 income
-    full_time_start_year=2030,       # When you graduate/start full-time
-    expected_full_time_wage=80000,   # Your expected starting salary
-    wage_growth_rate=0.04,           # Expected annual raise (4%)
-    retirement_income_target=55000,  # How much income you want in retirement (taxable)
-    savings_rate_gross=0.25          # % of gross income you can afford to save (e.g. 0.25 = 25%)
-)
+if __name__ == "__main__":
+    df_plan = optimize_rrsp_strategy()
 
-print(df_plan.to_string(index=False))
-df_plan.to_csv('plan.csv', index=False)
+    print("\n--- RRSP OPTIMIZATION PLAN ---\n")
+    print(df_plan.to_string(index=False))
+    
+    # Save to CSV for Excel/Numbers
+    df_plan.to_csv('plan.csv', index=False)
+    print("\nPlan saved to 'plan.csv'")
